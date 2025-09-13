@@ -1,3 +1,9 @@
+Gpt-mini 6
+descrição 
+um modelo de linguagem avançado 
+com multimodalidade 
+texto imagem vídeo geração de imagens 
+mini terminal mini navegador 
 camadas com atenção multi-head.
 
 Memória de longo prazo persistente.
@@ -15,7 +21,7 @@ Fornecer uma solução robusta para pesquisa, desenvolvimento e prototipagem de 
 Instalação e Uso:
 
 # Clone o repositório
-git clone.https://github.com/augustomiguelfarias7-cmd/GPT-Mini-6.git.git
+git clone https://github.com/seuusuario/gpt-mini6.git
 cd gpt-mini6
 
 # Instale dependências
