@@ -15,7 +15,7 @@ Fornecer uma solução robusta para pesquisa, desenvolvimento e prototipagem de 
 Instalação e Uso:
 
 # Clone o repositório
-git clone https://github.com/seuusuario/gpt-mini6.git
+git clone.https://github.com/augustomiguelfarias7-cmd/GPT-Mini-6.git.git
 cd gpt-mini6
 
 # Instale dependências
