@@ -1,353 +1,124 @@
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset, concatenate_datasets
-import numpy as np
 from PIL import Image
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
-import subprocess
-import requests
+import subprocess, requests, os
 from bs4 import BeautifulSoup
-import json
-import os
 
-# ===============================
-# Tokenizer com 2M tokens
-# ===============================
+# Tokenizer
 class SimpleTokenizer:
     def __init__(self, vocab_size=2_000_000):
-        self.vocab = {f"TOKEN_{i}": i for i in range(vocab_size)}
-        self.vocab["[PAD]"] = 0
-        self.vocab["[UNK]"] = 1
-        self.vocab_size = len(self.vocab)
+        self.vocab = {f"TOKEN{i}":i for i in range(vocab_size)}
+        self.vocab["[PAD]"]=0; self.vocab["[UNK]"]=1; self.vocab_size=len(self.vocab)
+    def encode(self,text): return [self.vocab.get(t,self.vocab["[UNK]"]) for t in text.split()]
+    def decode(self,ids): inv={v:k for k,v in self.vocab.items()}; return " ".join([inv.get(i,"[UNK]") for i in ids])
 
-    def encode(self, text):
-        return [self.vocab.get(tok, self.vocab["[UNK]"]) for tok in text.split()]
-
-    def decode(self, ids):
-        inv_vocab = {v:k for k,v in self.vocab.items()}
-        return " ".join([inv_vocab.get(i,"[UNK]") for i in ids])
-
-# ===============================
-# Transformer Block avançado
-# ===============================
+# Transformer block
 class AdvancedTransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_hidden):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(embed_dim, ff_hidden),
-            nn.GELU(),
-            nn.Linear(ff_hidden, embed_dim)
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
+    def __init__(self, d, heads, ff): super().__init__()
+        self.attn=nn.MultiheadAttention(d,heads,batch_first=True)
+        self.norm1=nn.LayerNorm(d); self.ff=nn.Sequential(nn.Linear(d,ff),nn.GELU(),nn.Linear(ff,d))
+        self.norm2=nn.LayerNorm(d)
+    def forward(self,x): a,_=self.attn(x,x,x); x=self.norm1(x+a); x=self.norm2(x+self.ff(x)); return x
 
-    def forward(self, x):
-        attn_out,_ = self.attn(x, x, x)
-        x = self.norm1(x + attn_out)
-        x = self.norm2(x + self.ff(x))
-        return x
-
-# ===============================
-# VAE para imagens
-# ===============================
+# VAE
 class ImageVAE(nn.Module):
-    def __init__(self, dim=4096):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, dim, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(dim, dim*2, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(dim*2, dim*4, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(dim*4, dim*8, 4, 2, 1), nn.ReLU(),
-            nn.Conv2d(dim*8, dim, 4, 2, 1)
-        )
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(dim, dim*8, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(dim*8, dim*4, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(dim*4, dim*2, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(dim*2, dim, 4, 2, 1), nn.ReLU(),
-            nn.ConvTranspose2d(dim, 3, 4, 2, 1), nn.Sigmoid()
-        )
+    def __init__(self,dim=4096):
+        super().__init__(); d2,d4,d8=dim*2,dim*4,dim*8
+        self.enc=nn.Sequential(nn.Conv2d(3,dim,4,2,1),nn.ReLU(),
+                               nn.Conv2d(dim,d2,4,2,1),nn.ReLU(),
+                               nn.Conv2d(d2,d4,4,2,1),nn.ReLU(),
+                               nn.Conv2d(d4,d8,4,2,1),nn.ReLU(),
+                               nn.Conv2d(d8,dim,4,2,1))
+        self.dec=nn.Sequential(nn.ConvTranspose2d(dim,d8,4,2,1),nn.ReLU(),
+                               nn.ConvTranspose2d(d8,d4,4,2,1),nn.ReLU(),
+                               nn.ConvTranspose2d(d4,d2,4,2,1),nn.ReLU(),
+                               nn.ConvTranspose2d(d2,dim,4,2,1),nn.ReLU(),
+                               nn.ConvTranspose2d(dim,3,4,2,1),nn.Sigmoid())
+    def encode(self,x): return self.enc(x)
+    def decode(self,z): return self.dec(z)
+    def show(self,t): plt.imshow(t.detach().cpu().clamp(0,1).permute(1,2,0));plt.axis('off');plt.show()
 
-    def encode(self, x): return self.encoder(x)
-    def decode(self, z): return self.decoder(z)
-    def show_image(self, tensor):
-        img = tensor.detach().cpu().clamp(0,1).permute(1,2,0).numpy()
-        plt.imshow(img); plt.axis('off'); plt.show()
+# Memória vetorial
+class LongTermMemoryVector:
+    def __init__(self,dim=512,device=None):
+        self.device=device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dim=dim; self.keys=torch.empty((0,dim),device=self.device); self.values=[]
+    def remember(self,text,value,encoder=None):
+        emb=F.normalize(torch.rand(self.dim,device=self.device) if encoder is None else F.normalize(encoder(text).to(self.device)))
+        self.keys=torch.cat([self.keys,emb.unsqueeze(0)],0); self.values.append(value)
+    def recall(self,text,encoder=None,top_k=1):
+        if len(self.values)==0: return []
+        emb=F.normalize(torch.rand(self.dim,device=self.device) if encoder is None else F.normalize(encoder(text).to(self.device)))
+        sim=F.cosine_similarity(emb.unsqueeze(0),self.keys); return [self.values[i] for i in sim.topk(top_k).indices.tolist()]
+    def clear(self): self.keys=torch.empty((0,self.dim),device=self.device); self.values=[]
 
-# ===============================
-# Memória de longo prazo
-# ===============================
-class LongTermMemory:
-    def __init__(self, memory_file="memory.json"):
-        self.memory_file = memory_file
-        if os.path.exists(memory_file):
-            with open(memory_file, "r") as f:
-                self.memory = json.load(f)
-        else:
-            self.memory = {}
-
-    def remember(self, key, value):
-        self.memory[key] = value
-        with open(self.memory_file, "w") as f:
-            json.dump(self.memory, f)
-
-    def recall(self, key):
-        return self.memory.get(key, None)
-
-# ===============================
-# Mini Navegador
-# ===============================
+# Mini browser
 class MiniBrowser:
-    def __init__(self, search_engine="https://www.google.com/search?q="):
-        self.search_engine = search_engine
+    def __init__(self,search_engine="https://www.google.com/search?q="): self.search_engine=search_engine
+    def search(self,q,num_results=3):
+        try: r=requests.get(self.search_engine+q.replace(" ","+"),headers={"User-Agent":"Mozilla/5.0"})
+        except Exception as e: return [str(e)]
+        soup=BeautifulSoup(r.text,"html.parser"); res=[]
+        for g in soup.find_all('a'):
+            h=g.get('href')
+            if h and h.startswith("/url?q="): res.append(h.split("/url?q=")[1].split("&")[0])
+            if len(res)>=num_results: break
+        return res
 
-    def search(self, query, num_results=3):
-        headers = {"User-Agent": "Mozilla/5.0"}
-        url = self.search_engine + query.replace(" ", "+")
-        try:
-            r = requests.get(url, headers=headers)
-            soup = BeautifulSoup(r.text, "html.parser")
-            results = []
-            for g in soup.find_all('a'):
-                href = g.get('href')
-                if href and href.startswith("/url?q="):
-                    clean_href = href.split("/url?q=")[1].split("&")[0]
-                    results.append(clean_href)
-                if len(results) >= num_results:
-                    break
-            return results
-        except Exception as e:
-            return [str(e)]
-
-# ===============================
-# Health Module
-# ===============================
+# Health
 class HealthModule:
-    def __init__(self):
-        self.status = {"memory_usage": 0, "gpu_usage": 0, "last_error": None}
+    def __init__(self): self.status={"memory":0,"gpu":0,"last_error":None}
+    def update(self): self.status["memory"]=torch.cuda.memory_allocated() if torch.cuda.is_available() else 0; self.status["gpu"]=torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+    def report_error(self,e): self.status["last_error"]=str(e)
+    def get_status(self): self.update(); return self.status
 
-    def update_memory(self):
-        self.status["memory_usage"] = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
-
-    def update_gpu(self):
-        self.status["gpu_usage"] = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
-
-    def report_error(self, e):
-        self.status["last_error"] = str(e)
-
-    def get_status(self):
-        self.update_memory()
-        self.update_gpu()
-        return self.status
-
-# ===============================
-# Dataset multimodal
-# ===============================
+# Dataset
 class GPTMiniDataset(Dataset):
-    def __init__(self, tokenizer, max_len=512):
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+    def __init__(self,tokenizer,max_len=512):
+        self.tokenizer=tokenizer; self.max_len=max_len
+        langs=["en","pt","fr","es","de"]; self.text_dataset=concatenate_datasets([load_dataset("wikipedia",f"20220301.{l}",split="train") for l in langs])
+        codes=["python","javascript","java","cpp","c"]; self.code_dataset=concatenate_datasets([load_dataset("bigcode/the-stack-dedup",split="train") for l in codes])
+        self.image_dataset=load_dataset("coco","2017",split="train"); self.transform_image=T.Compose([T.Resize((256,256)),T.ToTensor()])
+        try: self.reasoning_dataset=concatenate_datasets([load_dataset("gsm8k",split="train"),load_dataset("bigbench","logicaldeduction",split="train")])
+        except: self.reasoning_dataset=self.text_dataset
+        self.num_audio=10000
+    def __len__(self): return max(len(self.text_dataset),len(self.code_dataset),len(self.image_dataset),len(self.reasoning_dataset),self.num_audio)
+    def __getitem__(self,idx):
+        t=self.text_dataset[idx%len(self.text_dataset)]["text"]; t_t=torch.tensor(self.tokenizer.encode(t)[:self.max_len],dtype=torch.long)
+        c=self.code_dataset[idx%len(self.code_dataset)]["code"]; c_t=torch.tensor(self.tokenizer.encode(c)[:self.max_len],dtype=torch.long)
+        i=self.image_dataset[idx%len(self.image_dataset)]["image"]; i_t=Image.fromarray(i) if isinstance(i,np.ndarray) else i; i_t=self.transform_image(i_t)
+        r=self.reasoning_dataset[idx%len(self.reasoning_dataset)]; r_t=torch.tensor(self.tokenizer.encode(r.get("question",r.get("text","")))[:self.max_len],dtype=torch.long)
+        a=torch.rand((256,1024)); v=torch.rand((16,3,256,256))
+        return t_t,c_t,i_t,r_t,a,v
 
-        # Texto
-        langs = ["en","pt","fr","es","de"]
-        self.text_dataset = concatenate_datasets(
-            [load_dataset("wikipedia", f"20220301.{lang}", split="train") for lang in langs]
-        )
-
-        # Código
-        code_langs = ["python","javascript","java","cpp","c"]
-        self.code_dataset = concatenate_datasets(
-            [load_dataset("bigcode/the-stack-dedup", data_dir=f"data/{lang}", split="train") for lang in code_langs]
-        )
-
-        # Imagem
-        self.image_dataset = load_dataset("coco", "2017", split="train")
-        self.transform_image = T.Compose([T.Resize((256,256)), T.ToTensor()])
-
-        # Raciocínio
-        try:
-            reasoning_datasets = [
-                load_dataset("gsm8k", split="train"),
-                load_dataset("bigbench", "logical_deduction", split="train")
-            ]
-            self.reasoning_dataset = concatenate_datasets(reasoning_datasets)
-        except:
-            self.reasoning_dataset = self.text_dataset
-
-        # Áudio placeholder
-        self.num_audio = 10000
-
-    def __len__(self):
-        return max(len(self.text_dataset), len(self.code_dataset),
-                   len(self.image_dataset), len(self.reasoning_dataset),
-                   self.num_audio)
-
-    def __getitem__(self, idx):
-        text_sample = self.text_dataset[idx % len(self.text_dataset)]["text"]
-        text_tokens = torch.tensor(self.tokenizer.encode(text_sample)[:self.max_len], dtype=torch.long)
-
-        code_sample = self.code_dataset[idx % len(self.code_dataset)]["code"]
-        code_tokens = torch.tensor(self.tokenizer.encode(code_sample)[:self.max_len], dtype=torch.long)
-
-        img = self.image_dataset[idx % len(self.image_dataset)]["image"]
-        if isinstance(img, np.ndarray): img = Image.fromarray(img)
-        image_tensor = self.transform_image(img)
-
-        reasoning_sample = self.reasoning_dataset[idx % len(self.reasoning_dataset)]
-        reasoning_text = reasoning_sample.get("question", reasoning_sample.get("text",""))
-        reasoning_tokens = torch.tensor(self.tokenizer.encode(reasoning_text)[:self.max_len], dtype=torch.long)
-
-        audio_tensor = torch.rand((256,1024))
-        video_tensor = torch.rand((16,3,256,256))
-
-        return text_tokens, code_tokens, image_tensor, reasoning_tokens, audio_tensor, video_tensor
-
-# ===============================
-# GPT-Mini completo
-# ===============================
+# GPT-Mini 6
 class GPTMini(nn.Module):
-    def __init__(self, vocab_size=2_000_000, embed_dim=4096, depth=24, num_heads=32):
+    def __init__(self,vocab_size=2_000_000,embed_dim=4096,depth=24,heads=32):
         super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, 512, embed_dim))
-        self.transformer_blocks = nn.ModuleList([AdvancedTransformerBlock(embed_dim, num_heads, embed_dim*4) for _ in range(depth)])
-        self.ln_f = nn.LayerNorm(embed_dim)
-        self.text_head = nn.Linear(embed_dim, vocab_size)
-        self.code_head = nn.Linear(embed_dim, vocab_size)
-        self.reasoning_head = nn.Linear(embed_dim, vocab_size)
-        self.image_vae = ImageVAE(dim=embed_dim//2)
-        self.audio_fc = nn.Linear(1024, embed_dim)
-        self.video_fc = nn.Linear(16*3*256*256, embed_dim)
-        self.memory = LongTermMemory()
-        self.browser = MiniBrowser()
-        self.health = HealthModule()
+        self.token_embedding=nn.Embedding(vocab_size,embed_dim); self.pos_embedding=nn.Parameter(torch.randn(1,512,embed_dim))
+        self.blocks=nn.ModuleList([AdvancedTransformerBlock(embed_dim,heads,embed_dim*4) for _ in range(depth)])
+        self.ln_f=nn.LayerNorm(embed_dim)
+        self.text_head=nn.Linear(embed_dim,vocab_size); self.code_head=nn.Linear(embed_dim,vocab_size); self.reasoning_head=nn.Linear(embed_dim,vocab_size)
+        self.image_vae=ImageVAE(dim=embed_dim//2); self.audio_fc=nn.Linear(1024,embed_dim); self.video_fc=nn.Linear(16*3*256*256,embed_dim)
+        self.memory=LongTermMemoryVector(); self.browser=MiniBrowser(); self.health=HealthModule()
+    def forward_text(self,x): x=self.token_embedding(x)+self.pos_embedding[:,:x.size(1)]; [x:=b(x) for b in self.blocks]; return self.text_head(self.ln_f(x))
+    def forward_code(self,x): x=self.token_embedding(x)+self.pos_embedding[:,:x.size(1)]; [x:=b(x) for b in self.blocks]; return self.code_head(self.ln_f(x))
+    def forward_reasoning(self,x): x=self.token_embedding(x)+self.pos_embedding[:,:x.size(1)]; [x:=b(x) for b in self.blocks]; return self.reasoning_head(self.ln_f(x))
+    def forward_image(self,x): z=self.image_vae.encode(x.unsqueeze(0)); return self.image_vae.decode(z)[0]
+    def forward_audio(self,x): return self.audio_fc(x.mean(0,keepdim=True))
+    def forward_video(self,x): return self.video_fc(x.flatten(start_dim=1))
 
-    def forward_text(self, input_ids):
-        x = self.token_embedding(input_ids) + self.pos_embedding[:, :input_ids.size(1)]
-        for block in self.transformer_blocks: x = block(x)
-        x = self.ln_f(x)
-        return self.text_head(x)
-
-    def forward_code(self, input_ids):
-        x = self.token_embedding(input_ids) + self.pos_embedding[:, :input_ids.size(1)]
-        for block in self.transformer_blocks: x = block(x)
-        x = self.ln_f(x)
-        return self.code_head(x)
-
-    def forward_reasoning(self, input_ids):
-        x = self.token_embedding(input_ids) + self.pos_embedding[:, :input_ids.size(1)]
-        for block in self.transformer_blocks: x = block(x)
-        x = self.ln_f(x)
-        return self.reasoning_head(x)
-
-    def forward_image(self, image_tensor):
-        latent = self.image_vae.encode(image_tensor.unsqueeze(0))
-        return self.image_vae.decode(latent)[0]
-
-    def forward_audio(self, audio_tensor):
-        return self.audio_fc(audio_tensor.mean(dim=0, keepdim=True))
-
-    def forward_video(self, video_tensor):
-        flattened = video_tensor.flatten(start_dim=1)
-        return self.video_fc(flattened)
-
-# ===============================
-# Executor de código
-# ===============================
+# Executor
 class GPTMiniExecutor:
-    def run_python_code(self, code_str):
-        local_scope = {}
-        try:
-            exec(code_str, {"__builtins__": {}}, local_scope)
-            return local_scope
-        except Exception as e:
-            return str(e)
+    def run_python(self,s): l={}; exec(s,{"__builtins__":{}},l); return l
+    def run_terminal(self,c): r=subprocess.run(c,shell=True,capture_output=True,text=True,timeout=5); return r.stdout+r.stderr
 
-    def run_terminal_command(self, cmd_str):
-        try:
-            result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=5)
-            return result.stdout + result.stderr
-        except Exception as e:
-            return str(e)
-
-# ===============================
-# Geração de texto
-# ===============================
-def generate_text(model, tokenizer, prompt, max_len=200):  # 200 tokens por vez
-    model.eval()
-    ids = torch.tensor(tokenizer.encode(prompt), dtype=torch.long).unsqueeze(0)
-    for _ in range(max_len):
-        logits = model.forward_text(ids)
-        next_token = torch.argmax(logits[:, -1, :], dim=-1)
-        ids = torch.cat([ids, next_token.unsqueeze(0)], dim=1)
+# Geração texto
+def generate_text(model,tokenizer,prompt,maxlen=200):
+    model.eval(); ids=torch.tensor(tokenizer.encode(prompt),dtype=torch.long).unsqueeze(0)
+    for _ in range(maxlen):
+        logits=model.forward_text(ids); next_token=torch.argmax(logits[:,-1,:],dim=-1); ids=torch.cat([ids,next_token.unsqueeze(0)],1)
     return tokenizer.decode(ids[0].tolist())
-
-# ===============================
-# Treinamento multimodal
-# ===============================
-def train(epochs=1, batch_size=2):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = SimpleTokenizer()
-    dataset = GPTMiniDataset(tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    model = GPTMini().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion_text = nn.CrossEntropyLoss()
-    criterion_code = nn.CrossEntropyLoss()
-    criterion_reasoning = nn.CrossEntropyLoss()
-    criterion_image = nn.MSELoss()
-    criterion_audio = nn.MSELoss()
-    criterion_video = nn.MSELoss()
-
-    model.train()
-    for epoch in range(epochs):
-        for batch_idx, (text_tokens, code_tokens, image_tensor, reasoning_tokens, audio_tensor, video_tensor) in enumerate(dataloader):
-            text_tokens, code_tokens = text_tokens.to(device), code_tokens.to(device)
-            image_tensor, audio_tensor, video_tensor = image_tensor.to(device), audio_tensor.to(device), video_tensor.to(device)
-            reasoning_tokens = reasoning_tokens.to(device)
-
-            optimizer.zero_grad()
-            try:
-                loss_text = criterion_text(model.forward_text(text_tokens).view(-1, model.text_head.out_features), text_tokens.view(-1))
-                loss_code = criterion_code(model.forward_code(code_tokens).view(-1, model.code_head.out_features), code_tokens.view(-1))
-                loss_reasoning = criterion_reasoning(model.forward_reasoning(reasoning_tokens).view(-1, model.reasoning_head.out_features), reasoning_tokens.view(-1))
-                loss_image = criterion_image(model.forward_image(image_tensor), image_tensor)
-                loss_audio = criterion_audio(model.forward_audio(audio_tensor), audio_tensor.mean(dim=0, keepdim=True))
-                loss_video = criterion_video(model.forward_video(video_tensor), video_tensor.flatten(start_dim=1))
-                loss = loss_text + loss_code + loss_reasoning + loss_image + loss_audio + loss_video
-                loss.backward()
-                optimizer.step()
-            except Exception as e:
-                model.health.report_error(e)
-                continue
-
-            if batch_idx % 5 == 0:
-                print(f"Epoch {epoch+1} Batch {batch_idx} | "
-                      f"Text: {loss_text.item():.4f} | "
-                      f"Code: {loss_code.item():.4f} | "
-                      f"Reasoning: {loss_reasoning.item():.4f} | "
-                      f"Image: {loss_image.item():.4f} | "
-                      f"Audio: {loss_audio.item():.4f} | "
-                      f"Video: {loss_video.item():.4f} | "
-                      f"Health: {model.health.get_status()}")
-
-    return model, tokenizer
-
-# ===============================
-# Exemplo de uso
-# ===============================
-if __name__ == "__main__":
-    model, tokenizer = train(epochs=1, batch_size=2)
-    print(generate_text(model, tokenizer, "Once upon a time"))
-
-    executor = GPTMiniExecutor()
-    print("Python Executor Output:", executor.run_python_code("x = 5\ny = 10\nz = x + y\nz"))
-    print("Mini Terminal Output:", executor.run_terminal_command("echo Hello World"))
-
-    model.memory.remember("Augusto", "Criador do GPT-Mini")
-    print("Memory Recall:", model.memory.recall("Augusto"))
-    print("Search Results:", model.browser.search("OpenAI GPT"))
-    print("Health Status:", model.health.get_status())
